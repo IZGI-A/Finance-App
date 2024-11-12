@@ -1,0 +1,200 @@
+import pandas as pd
+import psycopg2
+from datetime import datetime, timedelta
+import logging
+from typing import Optional
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+DB_CONFIG = {
+    'host': '',
+    'database': '',
+    'user': '',
+    'password': ''
+}
+
+PAIRS = [
+    {'name': 'B', 'schema': 'bma'},
+    {'name': 'E', 'schema': 'ema'}
+]
+
+TIMEFRAMES = {
+    '5m': 5,
+    '15m': 15,
+    '30m': 30,
+    '60m': 60,
+    '120m': 120
+}
+
+# Batch size in hours
+BATCH_SIZE = 24  # Process 24 hours at a time
+
+
+def create_tables(cursor, schema):
+    for timeframe in TIMEFRAMES.keys():
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {schema}.candles_{timeframe} (
+                pair TEXT,
+                time TIMESTAMP,
+                open NUMERIC,
+                high NUMERIC,
+                low NUMERIC,
+                close NUMERIC,
+                volume NUMERIC,
+                PRIMARY KEY (pair, time)
+            )
+        """)
+
+
+def get_data_boundaries(cursor, schema, pair) -> tuple[Optional[datetime], Optional[datetime]]:
+    query = f"""
+        SELECT MIN(time), MAX(time)
+        FROM {schema}.candles_1m
+        WHERE pair = %s
+    """
+    cursor.execute(query, (pair,))
+    return cursor.fetchone()
+
+
+def get_last_processed_time(cursor, schema, pair, timeframe) -> Optional[datetime]:
+    query = f"""
+        SELECT MAX(time)
+        FROM {schema}.candles_{timeframe}
+        WHERE pair = %s
+    """
+    cursor.execute(query, (pair,))
+    return cursor.fetchone()[0]
+
+
+def fetch_1m_candles(cursor, schema, pair, start_time, end_time):
+    query = f"""
+        SELECT time, open, high, low, close, volume 
+        FROM {schema}.candles_1m 
+        WHERE pair = %s 
+        AND time >= %s 
+        AND time < %s 
+        ORDER BY time
+    """
+    cursor.execute(query, (pair, start_time, end_time))
+    rows = cursor.fetchall()
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df.set_index('time', inplace=True)
+    return df
+
+
+def resample_candles(df, timeframe_minutes):
+    rule = f'{timeframe_minutes}T'
+
+    resampled = pd.DataFrame()
+    resampled['open'] = df['open'].resample(rule).first()
+    resampled['high'] = df['high'].resample(rule).max()
+    resampled['low'] = df['low'].resample(rule).min()
+    resampled['close'] = df['close'].resample(rule).last()
+    resampled['volume'] = df['volume'].resample(rule).sum()
+
+    return resampled.dropna()
+
+
+def insert_resampled_candles(cursor, schema, pair, timeframe, df):
+    if df.empty:
+        return 0
+
+    records = [(
+        pair,
+        idx,
+        row['open'],
+        row['high'],
+        row['low'],
+        row['close'],
+        row['volume']
+    ) for idx, row in df.iterrows()]
+
+    query = f"""
+        INSERT INTO {schema}.candles_{timeframe} 
+        (pair, time, open, high, low, close, volume)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (pair, time) DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume
+    """
+    cursor.executemany(query, records)
+    return len(records)
+
+
+def process_pair_timeframe(cursor, schema, pair, timeframe, minutes, start_time, end_time):
+    batch_start = start_time
+    total_candles = 0
+
+    while batch_start < end_time:
+        batch_end = min(batch_start + timedelta(hours=BATCH_SIZE), end_time)
+
+        logging.info(f"Processing {pair} {timeframe} from {batch_start} to {batch_end}")
+
+        # Fetch and process batch
+        df_1m = fetch_1m_candles(cursor, schema, pair, batch_start, batch_end)
+        if df_1m is not None and not df_1m.empty:
+            resampled_df = resample_candles(df_1m, minutes)
+            candles_inserted = insert_resampled_candles(cursor, schema, pair, timeframe, resampled_df)
+            total_candles += candles_inserted
+            logging.info(f"Inserted {candles_inserted} candles for {timeframe}")
+
+        batch_start = batch_end
+
+    return total_candles
+
+
+def main():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    try:
+        for pair_config in PAIRS:
+            pair_name = pair_config['name']
+            schema = pair_config['schema']
+
+            create_tables(cursor, schema)
+
+            start_time, end_time = get_data_boundaries(cursor, schema, pair_name)
+            if not start_time or not end_time:
+                logging.warning(f"No data found for {pair_name}")
+                continue
+
+            logging.info(f"Processing {pair_name} data from {start_time} to {end_time}")
+
+            for timeframe, minutes in TIMEFRAMES.items():
+                last_processed = get_last_processed_time(cursor, schema, pair_name, timeframe)
+                batch_start = start_time if not last_processed else last_processed
+
+                if batch_start >= end_time:
+                    logging.info(f"{pair_name} {timeframe} is already up to date")
+                    continue
+
+                total_candles = process_pair_timeframe(
+                    cursor, schema, pair_name, timeframe,
+                    minutes, batch_start, end_time
+                )
+
+                conn.commit()
+                logging.info(f"Completed {timeframe} for {pair_name}. Total candles: {total_candles}")
+
+        logging.info("All pairs and timeframes processed successfully")
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"An error occurred: {str(e)}")
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
